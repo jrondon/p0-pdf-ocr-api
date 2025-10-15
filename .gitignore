@@ -129,6 +129,7 @@ test_files/
 *.tif
 *.tiff
 *.bmp
+*.txt
 
 # Logs
 *.log
