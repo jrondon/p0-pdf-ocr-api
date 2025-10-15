@@ -26,16 +26,45 @@ def ocr(
     deskew: int = Form(1),             # endereza páginas
     clean: int = Form(1),              # limpia artefactos
 ):
-    # Validar tipo de archivo por extensión
-    fname = (file.filename or "input").lower()
-    allowed = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
-    if not any(fname.endswith(ext) for ext in allowed):
-        raise HTTPException(400, detail="Solo PDF o imagen")
+    # Leer el contenido del archivo
+    file_content = file.file.read()
+    file.file.seek(0)  # Reset para poder leerlo de nuevo si es necesario
+    
+    # Detectar tipo de archivo por magic bytes
+    is_pdf = file_content[:5] == b"%PDF-"
+    is_png = file_content[:8] == b"\x89PNG\r\n\x1a\n"
+    is_jpg = file_content[:3] == b"\xff\xd8\xff"
+    is_tiff = file_content[:4] in (b"II*\x00", b"MM\x00*")
+    is_bmp = file_content[:2] == b"BM"
+    
+    # Validar que sea un tipo de archivo soportado
+    if not (is_pdf or is_png or is_jpg or is_tiff or is_bmp):
+        # Intentar validar también por extensión como fallback
+        fname = (file.filename or "input").lower()
+        allowed = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+        if not any(fname.endswith(ext) for ext in allowed):
+            raise HTTPException(400, detail="Solo PDF o imagen (formato no reconocido)")
+    
+    # Determinar extensión correcta basada en el contenido
+    if is_pdf:
+        ext = ".pdf"
+    elif is_png:
+        ext = ".png"
+    elif is_jpg:
+        ext = ".jpg"
+    elif is_tiff:
+        ext = ".tiff"
+    elif is_bmp:
+        ext = ".bmp"
+    else:
+        # Usar el nombre original si existe
+        fname = (file.filename or "input").lower()
+        ext = os.path.splitext(fname)[1] or ".pdf"
 
     with tempfile.TemporaryDirectory() as tmp:
-        in_path = os.path.join(tmp, os.path.basename(fname))
+        in_path = os.path.join(tmp, f"upload{ext}")
         with open(in_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+            f.write(file_content)
 
         # Si es imagen: usar tesseract directo a stdout
         if not in_path.endswith(".pdf"):
