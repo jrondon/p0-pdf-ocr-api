@@ -9,48 +9,37 @@ def health():
     return {"ok": True}
 
 @app.post("/ocr")
-async def ocr(
-    file: UploadFile = File(None),          # n8n suele enviar campo 'file'
-    pdf: UploadFile = File(None),           # por si envías 'pdf'
-    lang: str = Form("spa+eng"),
-    optimize: int = Form(0),
-    deskew: int = Form(1),
-    clean: int = Form(1),
+async def ocr_binary(
+    request: Request,
 ):
-    up = file or pdf
-    if up is None:
-        raise HTTPException(400, detail="Falta campo file/pdf")
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "Cuerpo vacío")
 
-    # Guardar a disco temporal
+    lang = request.headers.get("x-ocr-lang", "spa+eng")
+    optimize = int(request.headers.get("x-ocr-optimize", "0"))
+    deskew = request.headers.get("x-ocr-deskew", "1") == "1"
+    clean = request.headers.get("x-ocr-clean", "1") == "1"
+
     with tempfile.TemporaryDirectory() as tmp:
-        in_name = (up.filename or "upload.bin")
-        in_path = os.path.join(tmp, in_name)
+        in_path = os.path.join(tmp, "upload.pdf")
         with open(in_path, "wb") as f:
-            shutil.copyfileobj(up.file, f)
+            f.write(body)
 
-        # Detectar si es PDF por content-type y/o magic bytes
-        content_type = (up.content_type or "").lower()
-        is_pdf_ct = (content_type == "application/pdf")
-        is_pdf_magic = False
-        try:
-            with open(in_path, "rb") as f:
-                is_pdf_magic = f.read(5) == b"%PDF-"
-        except Exception:
-            pass
-        is_pdf = is_pdf_ct or is_pdf_magic or in_path.lower().endswith(".pdf")
-
+        # Detectar PDF por magic bytes
+        is_pdf = body[:5] == b"%PDF-"
         if not is_pdf:
-            # Imagen → tesseract directo
+            # tratar como imagen
             try:
                 text = subprocess.check_output(
                     ["tesseract", in_path, "stdout", "-l", lang],
                     stderr=subprocess.STDOUT
                 ).decode("utf-8", "ignore")
-                return JSONResponse({"text": text, "pages": 1, "engine": "tesseract"})
+                return {"text": text, "pages": 1, "engine": "tesseract"}
             except subprocess.CalledProcessError as e:
-                raise HTTPException(500, detail=e.output.decode("utf-8", "ignore"))
+                raise HTTPException(500, e.output.decode("utf-8", "ignore"))
 
-        # PDF → ocrmypdf con sidecar de texto
+        # PDF → ocrmypdf
         out_pdf = os.path.join(tmp, "out.pdf")
         sidecar = os.path.join(tmp, "out.txt")
         cmd = ["ocrmypdf", "--force-ocr", "--language", lang, "--sidecar", sidecar]
@@ -58,25 +47,10 @@ async def ocr(
         if deskew:   cmd += ["--deskew"]
         if clean:    cmd += ["--clean"]
         cmd += [in_path, out_pdf]
-
-        try:
-            subprocess.check_call(cmd)
-        except subprocess.CalledProcessError as e:
-            raise HTTPException(500, detail=f"ocrmypdf error: {e}")
+        subprocess.check_call(cmd)
 
         text = ""
         if os.path.exists(sidecar):
             with open(sidecar, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-
-        # páginas (best-effort)
-        pages = None
-        try:
-            info = subprocess.check_output(["pdfinfo", out_pdf]).decode("utf-8", "ignore")
-            for line in info.splitlines():
-                if line.lower().startswith("pages:"):
-                    pages = int(line.split(":")[1].strip()); break
-        except Exception:
-            pass
-
-        return JSONResponse({"text": text, "pages": pages, "engine": "ocrmypdf+tesseract"})
+        return {"text": text, "engine": "ocrmypdf+tesseract"}
