@@ -20,50 +20,57 @@ def health():
 
 @app.post("/ocr")
 async def ocr(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    pdf: UploadFile = File(None),      # acepta 'pdf' o 'file'
     lang: str = Form("spa+eng"),
-    optimize: int = Form(0),           # 0..3 (ocrmypdf)
-    deskew: int = Form(1),             # endereza páginas
-    clean: int = Form(1),              # limpia artefactos
+    optimize: int = Form(0),
+    deskew: int = Form(1),
+    clean: int = Form(1),
 ):
-    # Reglas simples de tamaño/ tipo
-    if file.spool_max_size and file.spool_max_size > 0:
-        pass  # n/a en FastAPI por defecto, mantenido por claridad
-    fname = (file.filename or "input").lower()
-    allowed = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
-    if not any(fname.endswith(ext) for ext in allowed):
-        raise HTTPException(400, detail="Solo PDF o imagen")
+    up = file or pdf
+    if up is None:
+        raise HTTPException(400, detail="Falta campo file/pdf")
 
+    # Detectar tipo por content-type o por magic bytes
+    content_type = (up.content_type or "").lower()
+    is_pdf_ct = content_type == "application/pdf"
+
+    import tempfile, os, shutil
     with tempfile.TemporaryDirectory() as tmp:
-        in_path = os.path.join(tmp, os.path.basename(fname))
+        in_path = os.path.join(tmp, up.filename or "upload.bin")
         with open(in_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+            shutil.copyfileobj(up.file, f)
 
-        # Si es imagen: usar tesseract directo a stdout
-        if not in_path.endswith(".pdf"):
+        # Leer cabecera para detectar PDF por magic bytes
+        is_pdf_magic = False
+        try:
+            with open(in_path, "rb") as f:
+                head = f.read(5)
+                is_pdf_magic = head == b"%PDF-"
+        except Exception:
+            pass
+
+        is_pdf = is_pdf_ct or is_pdf_magic or in_path.lower().endswith(".pdf")
+
+        if not is_pdf:
+            # Imagen → Tesseract directo
             try:
-                cmd = ["tesseract", in_path, "stdout", "-l", lang]
-                text = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore")
-                return JSONResponse({"text": text, "pages": 1, "engine": "tesseract"})
+                import subprocess
+                text = subprocess.check_output(["tesseract", in_path, "stdout", "-l", lang],
+                                               stderr=subprocess.STDOUT).decode("utf-8", "ignore")
+                return {"text": text, "pages": 1, "engine": "tesseract"}
             except subprocess.CalledProcessError as e:
-                raise HTTPException(500, detail=e.output.decode("utf-8", errors="ignore"))
+                raise HTTPException(500, detail=e.output.decode("utf-8", "ignore"))
 
-        # PDF multipágina: usar ocrmypdf con sidecar de texto
+        # PDF → ocrmypdf + sidecar
+        import subprocess
         out_pdf = os.path.join(tmp, "out.pdf")
         sidecar = os.path.join(tmp, "out.txt")
-        cmd = [
-            "ocrmypdf", "--force-ocr",
-            "--language", lang,
-            "--sidecar", sidecar,
-        ]
-        if optimize:
-            cmd += ["--optimize", str(optimize)]
-        if deskew:
-            cmd += ["--deskew"]
-        if clean:
-            cmd += ["--clean"]
+        cmd = ["ocrmypdf", "--force-ocr", "--language", lang, "--sidecar", sidecar]
+        if optimize: cmd += ["--optimize", str(optimize)]
+        if deskew:   cmd += ["--deskew"]
+        if clean:    cmd += ["--clean"]
         cmd += [in_path, out_pdf]
-
         try:
             subprocess.check_call(cmd)
         except subprocess.CalledProcessError as e:
@@ -74,15 +81,15 @@ async def ocr(
             with open(sidecar, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
 
-        # Intento obtener número de páginas (poppler utils)
-        pages = 0
+        # obtener páginas (best-effort)
+        pages = None
         try:
-            out = subprocess.check_output(["pdfinfo", out_pdf]).decode("utf-8", errors="ignore")
-            for line in out.splitlines():
+            info = subprocess.check_output(["pdfinfo", out_pdf]).decode("utf-8", "ignore")
+            for line in info.splitlines():
                 if line.lower().startswith("pages:"):
                     pages = int(line.split(":")[1].strip())
                     break
         except Exception:
-            pages = None
+            pass
 
-        return JSONResponse({"text": text, "pages": pages, "engine": "ocrmypdf+tesseract"})
+        return {"text": text, "pages": pages, "engine": "ocrmypdf+tesseract"}
